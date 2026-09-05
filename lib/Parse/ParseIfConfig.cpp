@@ -160,6 +160,42 @@ static Expr *getSingleSubExp(ArgumentList *args, StringRef kindName,
   return nullptr;
 }
 
+static bool isDeploymentTargetPlatformActive(const LangOptions &langOpts,
+                                             StringRef platform) {
+  if (platform == "macCatalyst") {
+    return langOpts.checkPlatformCondition(
+        PlatformConditionKind::TargetEnvironment, platform);
+  }
+  return langOpts.checkPlatformCondition(PlatformConditionKind::OS, platform);
+}
+
+static int getDeploymentTargetPlatformPriority(StringRef platform) {
+  if (platform == "anyAppleOS")
+    return 0;
+  if (platform == "macCatalyst")
+    return 2;
+  return 1;
+}
+
+static StringRef canonicalDeploymentTargetPlatform(StringRef platform) {
+  if (platform == "OSX")
+    return "macOS";
+  if (platform == "xrOS")
+    return "visionOS";
+  return platform;
+}
+
+static bool isDeploymentTargetPlatformSupported(StringRef platform) {
+  static const StringRef supportedPlatforms[] = {
+      "OSX",         "macOS",   "tvOS",       "watchOS", "iOS",
+      "visionOS",    "xrOS",    "Firmware",   "Linux",   "FreeBSD",
+      "OpenBSD",     "Windows", "Android",    "PS4",     "Cygwin",
+      "Haiku",       "WASI",    "Emscripten", "none",    "anyAppleOS",
+      "macCatalyst",
+  };
+  return llvm::is_contained(supportedPlatforms, platform);
+}
+
 /// Returns \c true if the condition is a version check.
 static bool isVersionIfConfigCondition(Expr *Condition);
 
@@ -172,6 +208,7 @@ class ValidateIfConfigCondition :
   public ExprVisitor<ValidateIfConfigCondition, Expr*> {
   ASTContext &Ctx;
   DiagnosticEngine &D;
+  bool CheckBuildConfiguration;
 
   bool HasError;
 
@@ -202,6 +239,97 @@ class ValidateIfConfigCondition :
     D.diagnose(E->getLoc(),
                diag::unsupported_conditional_compilation_expression_type);
     return nullptr;
+  }
+
+  Expr *validateDeploymentTargetAtLeast(CallExpr *E) {
+    if (CheckBuildConfiguration &&
+        !Ctx.LangOpts.hasFeature(Feature::DeploymentTargetCondition)) {
+      D.diagnose(E->getLoc(), diag::deployment_target_condition_disabled);
+      return nullptr;
+    }
+
+    auto *args = E->getArgs();
+    SmallVector<StringRef, 4> seenPlatforms;
+    bool hasWildcard = false;
+
+    for (unsigned index = 0; index < args->size(); ++index) {
+      auto argument = (*args)[index];
+      auto *argumentExpr = argument.getExpr();
+
+      if (!argument.hasLabel()) {
+        auto name = getDeclRefStr(argumentExpr, DeclRefKind::Ordinary);
+        if (name && *name == "*") {
+          if (hasWildcard || index + 1 != args->size()) {
+            D.diagnose(argumentExpr->getLoc(),
+                       diag::deployment_target_wildcard_must_be_last);
+            return nullptr;
+          }
+          hasWildcard = true;
+          continue;
+        }
+
+        D.diagnose(argumentExpr->getLoc(),
+                   diag::deployment_target_expected_platform_version);
+        return nullptr;
+      }
+
+      StringRef platform = argument.getLabel().str();
+      StringRef canonicalPlatform = canonicalDeploymentTargetPlatform(platform);
+      if (llvm::is_contained(seenPlatforms, canonicalPlatform)) {
+        D.diagnose(argument.getLabelLoc(),
+                   diag::deployment_target_duplicate_platform, platform);
+        return nullptr;
+      }
+      seenPlatforms.push_back(canonicalPlatform);
+
+      if (!isDeploymentTargetPlatformSupported(platform))
+        D.diagnose(argument.getLabelLoc(),
+                   diag::deployment_target_unknown_platform, platform);
+
+      auto versionString = extractExprSource(Ctx.SourceMgr, argumentExpr);
+      auto version = VersionParser::parseVersionString(
+          versionString, argumentExpr->getStartLoc(), &D);
+      if (!version)
+        return nullptr;
+
+      if (platform == "anyAppleOS" && !version->isVersionAtLeast(26))
+        D.diagnose(argumentExpr->getLoc(),
+                   diag::deployment_target_invalid_any_apple_os_version,
+                   versionString);
+    }
+
+    if (!hasWildcard) {
+      D.diagnose(E->getLoc(), diag::deployment_target_missing_wildcard);
+      return nullptr;
+    }
+
+    if (CheckBuildConfiguration && !Ctx.LangOpts.getDeploymentTargetVersion()) {
+      std::optional<Argument> selectedArgument;
+      int selectedPriority = -1;
+      for (auto argument : *args) {
+        if (!argument.hasLabel())
+          continue;
+
+        StringRef platform = argument.getLabel().str();
+        if (!isDeploymentTargetPlatformActive(Ctx.LangOpts, platform))
+          continue;
+
+        int priority = getDeploymentTargetPlatformPriority(platform);
+        if (priority > selectedPriority) {
+          selectedArgument = argument;
+          selectedPriority = priority;
+        }
+      }
+
+      if (selectedArgument) {
+        D.diagnose(selectedArgument->getLabelLoc(),
+                   diag::deployment_target_condition_unavailable,
+                   selectedArgument->getLabel().str());
+        return nullptr;
+      }
+    }
+
+    return E;
   }
 
   // Support '||' and '&&' operator. The precedence of '&&' is higher than '||'.
@@ -268,8 +396,10 @@ class ValidateIfConfigCondition :
   }
 
 public:
-  ValidateIfConfigCondition(ASTContext &Ctx, DiagnosticEngine &D)
-    : Ctx(Ctx), D(D), HasError(false) {}
+  ValidateIfConfigCondition(ASTContext &Ctx, DiagnosticEngine &D,
+                            bool CheckBuildConfiguration)
+      : Ctx(Ctx), D(D), CheckBuildConfiguration(CheckBuildConfiguration),
+        HasError(false) {}
 
   // Explicit configuration flag.
   Expr *visitUnresolvedDeclRefExpr(UnresolvedDeclRefExpr *E) {
@@ -305,6 +435,9 @@ public:
       D.diagnose(E->getLoc(), diag::unsupported_platform_condition_expression);
       return nullptr;
     }
+
+    if (*KindName == "deploymentTargetAtLeast")
+      return validateDeploymentTargetAtLeast(E);
 
     Expr *Arg = getSingleSubExp(E->getArgs(), *KindName, &D);
     if (!Arg) {
@@ -537,10 +670,10 @@ public:
 
 /// Validate and modify the condition expression.
 /// Returns \c true if the condition contains any error.
-static bool validateIfConfigCondition(Expr *&condition,
-                                      ASTContext &Context,
-                                      DiagnosticEngine &D) {
-  ValidateIfConfigCondition Validator(Context, D);
+static bool validateIfConfigCondition(Expr *&condition, ASTContext &Context,
+                                      DiagnosticEngine &D,
+                                      bool CheckBuildConfiguration) {
+  ValidateIfConfigCondition Validator(Context, D, CheckBuildConfiguration);
   condition = Validator.validate(condition);
   return Validator.hasError();
 }
@@ -555,6 +688,39 @@ class EvaluateIfConfigCondition :
   /// \c UnresolvedDeclRefExpr.
   StringRef getDeclRefStr(Expr *E) {
     return cast<UnresolvedDeclRefExpr>(E)->getName().getBaseIdentifier().str();
+  }
+
+  bool evaluateDeploymentTargetAtLeast(CallExpr *E) {
+    std::optional<version::Version> selectedVersion;
+    int selectedPriority = -1;
+
+    for (auto argument : *E->getArgs()) {
+      if (!argument.hasLabel())
+        continue;
+
+      StringRef platform = argument.getLabel().str();
+      if (!isDeploymentTargetPlatformActive(Ctx.LangOpts, platform))
+        continue;
+
+      int priority = getDeploymentTargetPlatformPriority(platform);
+      if (priority <= selectedPriority)
+        continue;
+
+      auto versionString = extractExprSource(Ctx.SourceMgr, argument.getExpr());
+      selectedVersion =
+          VersionParser::parseVersionString(versionString, SourceLoc(), nullptr)
+              .value();
+      selectedPriority = priority;
+    }
+
+    if (!selectedVersion)
+      return true;
+
+    auto deploymentTarget = Ctx.LangOpts.getDeploymentTargetVersion();
+    assert(deploymentTarget && "deployment target condition was not validated");
+    if (!deploymentTarget)
+      return false;
+    return version::Version(*deploymentTarget) >= *selectedVersion;
   }
 
 public:
@@ -581,6 +747,9 @@ public:
 
   bool visitCallExpr(CallExpr *E) {
     auto KindName = getDeclRefStr(E->getFn());
+    if (KindName == "deploymentTargetAtLeast")
+      return evaluateDeploymentTargetAtLeast(E);
+
     auto *Arg = getSingleSubExp(E->getArgs(), KindName, nullptr);
     if (KindName == "_compiler_version" && isa<StringLiteralExpr>(Arg)) {
       auto Str = cast<StringLiteralExpr>(Arg)->getValue();
@@ -888,7 +1057,8 @@ Result Parser::parseIfConfigRaw(
           isActive = evalResult->first;
           isVersionCondition = evalResult->second;
         }
-      } else if (validateIfConfigCondition(Condition, Context, Diags)) {
+      } else if (validateIfConfigCondition(Condition, Context, Diags,
+                                           shouldEvaluate)) {
         // Error in the condition;
         isActive = false;
         isVersionCondition = false;

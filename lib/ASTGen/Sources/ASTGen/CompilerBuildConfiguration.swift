@@ -175,6 +175,10 @@ struct CompilerBuildConfiguration: BuildConfiguration {
   var compilerVersion: VersionTuple {
     staticBuildConfiguration.compilerVersion
   }
+
+  var deploymentTargetVersion: VersionTuple? {
+    staticBuildConfiguration.deploymentTargetVersion
+  }
 }
 
 enum IfConfigError: Error, CustomStringConvertible {
@@ -525,7 +529,7 @@ public func evaluatePoundIfCondition(
   // FIXME: Use 'ExportedSourceFile' when C++ parser is replaced.
   let textBuffer = UnsafeBufferPointer<UInt8>(start: ifConditionText.data, count: ifConditionText.count)
   var parser = Parser(textBuffer)
-  let conditionExpr = ExprSyntax.parse(from: &parser)
+  let conditionExpr = ExprSyntax.parseIfConfigCondition(from: &parser)
 
   let isActive: Bool
   let syntaxErrorsAllowed: Bool

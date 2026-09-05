@@ -143,4 +143,8 @@ struct EmbeddedBuildConfiguration: BuildConfiguration {
   var compilerVersion: VersionTuple {
     return configuration.compilerVersion
   }
+
+  var deploymentTargetVersion: VersionTuple? {
+    return configuration.deploymentTargetVersion
+  }
 }
